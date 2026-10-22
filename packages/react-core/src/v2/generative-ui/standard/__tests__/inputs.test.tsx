@@ -8,6 +8,7 @@ import {
   describeDateTime,
   inputComponents,
   splitDateTime,
+  timeInRange,
   timeSlots,
 } from "../inputs";
 import { layoutComponents } from "../layout";
@@ -528,15 +529,21 @@ describe("standard inputs: events", () => {
 });
 
 describe("standard inputs: DateTimeInput", () => {
-  const inWords = (date: string, time: string, mode: "date" | "time" | "datetime") =>
-    describeDateTime({ date, time }, mode);
+  const inWords = (
+    date: string,
+    time: string,
+    mode: "date" | "time" | "datetime",
+  ) => describeDateTime({ date, time }, mode);
 
   it("splits an ISO value into its date and its time", () => {
     expect(splitDateTime("2026-10-23T14:30")).toEqual({
       date: "2026-10-23",
       time: "14:30",
     });
-    expect(splitDateTime("2026-10-23")).toEqual({ date: "2026-10-23", time: "" });
+    expect(splitDateTime("2026-10-23")).toEqual({
+      date: "2026-10-23",
+      time: "",
+    });
     expect(splitDateTime("09:15")).toEqual({ date: "", time: "09:15" });
     expect(splitDateTime("")).toEqual({ date: "", time: "" });
   });
@@ -556,7 +563,9 @@ describe("standard inputs: DateTimeInput", () => {
     expect(
       describeDateTime({ date: "2026-10-23", time: "" }, "datetime"),
     ).toBeUndefined();
-    expect(describeDateTime({ date: "soon", time: "" }, "date")).toBeUndefined();
+    expect(
+      describeDateTime({ date: "soon", time: "" }, "date"),
+    ).toBeUndefined();
   });
 
   it("lists the times of a day step minutes apart within the bounds, keeping a current off-step time", () => {
@@ -600,7 +609,9 @@ describe("standard inputs: DateTimeInput", () => {
     expect(date.value).toBe("2026-10-23");
     fireEvent.change(time, { target: { value: "14:30" } });
     expect(view.dataAt("/when")).toBe("2026-10-23T14:30");
-    expect(view.getByText(inWords("2026-10-23", "14:30", "datetime")!)).toBeTruthy();
+    expect(
+      view.getByText(inWords("2026-10-23", "14:30", "datetime")!),
+    ).toBeTruthy();
     // Clearing the time clears the value and keeps the date.
     fireEvent.change(time, { target: { value: "" } });
     expect(view.dataAt("/when")).toBe("");
@@ -672,7 +683,9 @@ describe("standard inputs: DateTimeInput", () => {
       ],
       { at: "" },
     );
-    const select = (await view.findByLabelText("Call time")) as HTMLSelectElement;
+    const select = (await view.findByLabelText(
+      "Call time",
+    )) as HTMLSelectElement;
     expect(select.tagName).toBe("SELECT");
     expect([...select.options].map((o) => o.value)).toEqual([
       "",
@@ -683,6 +696,76 @@ describe("standard inputs: DateTimeInput", () => {
     expect(select.options[2].textContent).toBe(inWords("", "09:30", "time"));
     fireEvent.change(select, { target: { value: "09:30" } });
     expect(view.dataAt("/at")).toBe("09:30");
+  });
+
+  it("formats the value as written, not shifted by a daylight-saving gap of the viewer", () => {
+    const zone = process.env.TZ;
+    process.env.TZ = "Europe/Vienna";
+    try {
+      // 02:30 on 29 March 2026 does not exist in Vienna.
+      const text = describeDateTime(
+        { date: "2026-03-29", time: "02:30" },
+        "datetime",
+        "en-US",
+      );
+      expect(text).toContain("2:30");
+      expect(text).not.toContain("3:30");
+    } finally {
+      process.env.TZ = zone;
+    }
+  });
+
+  it("lists a range over midnight from its start", () => {
+    expect(timeInRange("23:00", "22:00", "02:00")).toBe(true);
+    expect(timeInRange("01:00", "22:00", "02:00")).toBe(true);
+    expect(timeInRange("12:00", "22:00", "02:00")).toBe(false);
+    expect(timeSlots(60, "22:00", "02:00")).toEqual([
+      "22:00",
+      "23:00",
+      "00:00",
+      "01:00",
+      "02:00",
+    ]);
+  });
+
+  it("marks a listed time that the date moved out of range as invalid, so a form does not submit it", async () => {
+    const view = renderInputs(
+      [
+        {
+          id: "root",
+          component: "Form",
+          label: "Booking",
+          children: ["when"],
+        },
+        {
+          id: "when",
+          component: "DateTimeInput",
+          label: "Call",
+          enableDate: true,
+          enableTime: true,
+          timeStep: 30,
+          min: "2026-11-02T09:00",
+          value: { "@path": "/when" },
+        },
+      ],
+      { when: "2026-11-03T08:30" },
+    );
+    const form = (await view.findByRole("form")) as HTMLFormElement;
+    const time = view.getByLabelText("Time") as HTMLSelectElement;
+    // The day after the bound: 08:30 is fine.
+    expect(form.checkValidity()).toBe(true);
+    fireEvent.change(view.getByLabelText("Date"), {
+      target: { value: "2026-11-02" },
+    });
+    expect(time.value).toBe("08:30");
+    expect(time.getAttribute("aria-invalid")).toBe("true");
+    expect(form.checkValidity()).toBe(false);
+    expect(view.getByRole("alert").textContent).toBe(
+      `Pick a time from ${inWords("", "09:00", "time")} to the end of the day`,
+    );
+    fireEvent.change(time, { target: { value: "09:30" } });
+    expect(form.checkValidity()).toBe(true);
+    expect(view.queryByRole("alert")).toBeNull();
   });
 
   it("keeps a single time field named by its label", async () => {

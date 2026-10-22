@@ -431,6 +431,24 @@ function controlStyle(
   } satisfies CSSProperties;
 }
 
+/**
+ * A native select without its native look, so it takes the height,
+ * padding and corners of the other fields (Safari keeps a fixed, compact
+ * height otherwise), with a chevron drawn on the right. The option list
+ * stays native.
+ */
+const SELECT_STYLE = {
+  appearance: "none",
+  WebkitAppearance: "none",
+  paddingRight: 32,
+  backgroundImage: `url("data:image/svg+xml,${encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="#8e8e93" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5 6 7.5 9 4.5"/></svg>',
+  )}")`,
+  backgroundRepeat: "no-repeat",
+  backgroundPosition: "right 12px center",
+  backgroundSize: "12px 12px",
+} satisfies CSSProperties;
+
 const FIELD_LABEL_STYLE = {
   ...textFont("sm"),
   fontWeight: FONT_WEIGHT.medium,
@@ -913,15 +931,20 @@ export function describeDateTime(
   const date = /^(\d{4})-(\d{2})-(\d{2})$/.exec(parts.date);
   const time = /^(\d{1,2}):(\d{2})/.exec(parts.time);
   if ((mode !== "time" && !date) || (mode !== "date" && !time)) return;
+  // The value has no time zone: it is formatted as written, in UTC, so a
+  // daylight-saving gap of the viewer cannot shift it.
   const at = new Date(
-    date ? Number(date[1]) : 2000,
-    date ? Number(date[2]) - 1 : 0,
-    date ? Number(date[3]) : 1,
-    time ? Number(time[1]) : 0,
-    time ? Number(time[2]) : 0,
+    Date.UTC(
+      date ? Number(date[1]) : 2000,
+      date ? Number(date[2]) - 1 : 0,
+      date ? Number(date[3]) : 1,
+      time ? Number(time[1]) : 0,
+      time ? Number(time[2]) : 0,
+    ),
   );
   if (Number.isNaN(at.getTime())) return;
   return new Intl.DateTimeFormat(locale, {
+    timeZone: "UTC",
     ...(mode === "time"
       ? {}
       : { weekday: "short", year: "numeric", month: "short", day: "numeric" }),
@@ -936,8 +959,22 @@ function minuteToTime(minute: number) {
 }
 
 /**
+ * True when `time` ("HH:MM") lies within `min`..`max`. A `min` after `max`
+ * is a range over midnight, such as 22:00 to 02:00.
+ */
+export function timeInRange(time: string, min?: string, max?: string) {
+  const at = time.slice(0, 5);
+  const from = min?.slice(0, 5);
+  const to = max?.slice(0, 5);
+  if (from && to && from > to) return at >= from || at <= to;
+  return (!from || at >= from) && (!to || at <= to);
+}
+
+/**
  * The times of a day `step` minutes apart within `min`..`max` ("HH:MM"),
- * plus `current` when it is set and not one of them.
+ * from `min` on (a range over midnight continues after 23:59), plus
+ * `current` when it is set and not one of them, so the list shows the value
+ * it holds even when that value is out of range.
  */
 export function timeSlots(
   step: number,
@@ -945,19 +982,19 @@ export function timeSlots(
   max?: string,
   current?: string,
 ): string[] {
+  const from = min?.slice(0, 5);
+  const wraps = Boolean(from && max && from > max.slice(0, 5));
+  // Order a range over midnight from its start: 22:00, 23:00, 00:00.
+  const order = (time: string) =>
+    wraps && from && time < from ? `1${time}` : `0${time}`;
   const slots: string[] = [];
   for (let minute = 0; minute < 24 * 60; minute += step) {
     const time = minuteToTime(minute);
-    if (min && time < min.slice(0, 5)) continue;
-    if (max && time > max.slice(0, 5)) continue;
-    slots.push(time);
+    if (timeInRange(time, min, max)) slots.push(time);
   }
   const shown = current?.slice(0, 5);
-  if (shown && !slots.includes(shown)) {
-    slots.push(shown);
-    slots.sort();
-  }
-  return slots;
+  if (shown && !slots.includes(shown)) slots.push(shown);
+  return slots.sort((a, b) => (order(a) < order(b) ? -1 : 1));
 }
 
 /**
@@ -1007,6 +1044,30 @@ function DateTimeInput(props: DateTimeInputProps) {
       ? max.time || undefined
       : undefined;
 
+  // A list does not enforce min and max like a time field does: a time
+  // left out of range (the date moved to the day of a bound) is invalid.
+  const slotList = useRef<HTMLSelectElement>(null);
+  const slotOutOfRange =
+    props.timeStep !== undefined &&
+    parts.time !== "" &&
+    !timeInRange(parts.time, timeMin, timeMax);
+  const rangeError: FailedCheck | undefined = slotOutOfRange
+    ? {
+        message: `Pick a time from ${
+          (timeMin && describeDateTime({ date: "", time: timeMin }, "time")) ||
+          "the start of the day"
+        } to ${
+          (timeMax && describeDateTime({ date: "", time: timeMax }, "time")) ||
+          "the end of the day"
+        }`,
+        severity: "error",
+        code: "TIME_OUT_OF_RANGE",
+      }
+    : undefined;
+  useEffect(() => {
+    slotList.current?.setCustomValidity(rangeError?.message ?? "");
+  }, [rangeError?.message]);
+
   const summary = describeDateTime(parts, mode);
   const isSplit = mode === "datetime";
   const showClear = props.clearable && (parts.date !== "" || parts.time !== "");
@@ -1048,19 +1109,19 @@ function DateTimeInput(props: DateTimeInputProps) {
       <select
         {...common}
         {...single}
+        ref={slotList}
         aria-label={isSplit ? "Time" : singleLabel}
+        aria-invalid={check.invalid || slotOutOfRange || undefined}
         value={parts.time.slice(0, 5)}
         onChange={(event) => write({ ...parts, time: event.target.value })}
-        style={{ ...style, flex: "1 1 8em", width: "auto" }}
+        style={{ ...style, ...SELECT_STYLE, flex: "1 1 8em", width: "auto" }}
       >
         <option value="">{props.placeholder ?? "Time"}</option>
-        {timeSlots(props.timeStep, timeMin, timeMax, parts.time).map(
-          (slot) => (
-            <option key={slot} value={slot}>
-              {describeDateTime({ date: "", time: slot }, "time") ?? slot}
-            </option>
-          ),
-        )}
+        {timeSlots(props.timeStep, timeMin, timeMax, parts.time).map((slot) => (
+          <option key={slot} value={slot}>
+            {describeDateTime({ date: "", time: slot }, "time") ?? slot}
+          </option>
+        ))}
       </select>
     ) : (
       <input
@@ -1083,7 +1144,7 @@ function DateTimeInput(props: DateTimeInputProps) {
       htmlFor={isSplit ? undefined : id}
       labelId={isSplit ? labelId : undefined}
       weight={props.weight}
-      error={check.error}
+      error={check.error ?? rangeError}
       onBlur={check.onBlur}
     >
       <div
@@ -1314,6 +1375,7 @@ function Select(props: SelectProps) {
       onChange={(event) => props.setValue(event.target.value)}
       style={{
         ...controlStyle(props, "xl"),
+        ...SELECT_STYLE,
         width: props.block === false ? undefined : "100%",
         paddingLeft: props.icon
           ? `${PAD_X[props.size ?? "xl"] + 24}px`
