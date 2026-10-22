@@ -1,4 +1,4 @@
-import React, { useId, useRef, useState } from "react";
+import React, { useEffect, useId, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
 import { z } from "zod";
 import type { GenerativeUIInvokeResult } from "../errors";
@@ -336,6 +336,15 @@ const dateTimeInputSchema = z.object({
       "The user picks a date. Default true unless only enableTime is set",
     ),
   enableTime: z.boolean().optional().describe("The user picks a time"),
+  timeStep: z
+    .number()
+    .int()
+    .min(1)
+    .max(720)
+    .optional()
+    .describe(
+      "Minutes between the times the user can pick, e.g. 15 or 30. Shows the time as a list",
+    ),
   weight: weightProp,
   min: z.string().optional().describe("The earliest value, ISO 8601"),
   max: z.string().optional().describe("The latest value, ISO 8601"),
@@ -860,58 +869,244 @@ type DateTimeInputProps = z.output<typeof dateTimeInputSchema> & {
   setValue: (value: string) => void;
 };
 
-/** The input type: a date by default, a time, or both. */
-function dateTimeInputType(props: DateTimeInputProps) {
+type DateTimeMode = "date" | "time" | "datetime";
+
+/** What the user picks: a date by default, a time, or both. */
+function dateTimeMode(props: DateTimeInputProps): DateTimeMode {
   const hasTime = props.enableTime === true;
   const hasDate = props.enableDate ?? !hasTime;
-  return hasDate && hasTime ? "datetime-local" : hasTime ? "time" : "date";
+  return hasDate && hasTime ? "datetime" : hasTime ? "time" : "date";
 }
 
+interface DateTimeParts {
+  /** "YYYY-MM-DD", or "" */
+  date: string;
+  /** "HH:MM" (seconds kept when given), or "" */
+  time: string;
+}
+
+/** The date and the time of an ISO 8601 value: a date, a time, or both. */
+export function splitDateTime(value: string): DateTimeParts {
+  const [head, tail] = value.split("T");
+  if (tail !== undefined) return { date: head, time: tail };
+  if (/^\d{4}-/.test(value)) return { date: value, time: "" };
+  if (/^\d{1,2}:\d{2}/.test(value)) return { date: "", time: value };
+  return { date: "", time: "" };
+}
+
+/** The value of the parts, or "" while a part the mode needs is missing. */
+function joinDateTime(parts: DateTimeParts, mode: DateTimeMode): string {
+  if (mode === "date") return parts.date;
+  if (mode === "time") return parts.time;
+  return parts.date && parts.time ? `${parts.date}T${parts.time}` : "";
+}
+
+/**
+ * The value in words, in the user's locale: "Thu, Oct 23, 2026, 2:30 PM".
+ * Undefined for an incomplete or unparsable value.
+ */
+export function describeDateTime(
+  parts: DateTimeParts,
+  mode: DateTimeMode,
+  locale?: string,
+): string | undefined {
+  const date = /^(\d{4})-(\d{2})-(\d{2})$/.exec(parts.date);
+  const time = /^(\d{1,2}):(\d{2})/.exec(parts.time);
+  if ((mode !== "time" && !date) || (mode !== "date" && !time)) return;
+  const at = new Date(
+    date ? Number(date[1]) : 2000,
+    date ? Number(date[2]) - 1 : 0,
+    date ? Number(date[3]) : 1,
+    time ? Number(time[1]) : 0,
+    time ? Number(time[2]) : 0,
+  );
+  if (Number.isNaN(at.getTime())) return;
+  return new Intl.DateTimeFormat(locale, {
+    ...(mode === "time"
+      ? {}
+      : { weekday: "short", year: "numeric", month: "short", day: "numeric" }),
+    ...(mode === "date" ? {} : { hour: "numeric", minute: "2-digit" }),
+  }).format(at);
+}
+
+/** "HH:MM" of a minute of the day. */
+function minuteToTime(minute: number) {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(Math.floor(minute / 60))}:${pad(minute % 60)}`;
+}
+
+/**
+ * The times of a day `step` minutes apart within `min`..`max` ("HH:MM"),
+ * plus `current` when it is set and not one of them.
+ */
+export function timeSlots(
+  step: number,
+  min?: string,
+  max?: string,
+  current?: string,
+): string[] {
+  const slots: string[] = [];
+  for (let minute = 0; minute < 24 * 60; minute += step) {
+    const time = minuteToTime(minute);
+    if (min && time < min.slice(0, 5)) continue;
+    if (max && time > max.slice(0, 5)) continue;
+    slots.push(time);
+  }
+  const shown = current?.slice(0, 5);
+  if (shown && !slots.includes(shown)) {
+    slots.push(shown);
+    slots.sort();
+  }
+  return slots;
+}
+
+/**
+ * A date, a time, or both. A date and a time are two fields under one
+ * label, so each stays short and readable in every browser; the value is
+ * written once both are set. Under the fields, the value in words makes the
+ * date and the time (AM/PM included) unambiguous. `timeStep` shows the time
+ * as a list of times instead of a typed field.
+ */
 function DateTimeInput(props: DateTimeInputProps) {
   useStandardStyles();
   const aria = useGenerativeUIAccessibility();
   const id = useId();
+  const labelId = useId();
+  const summaryId = useId();
+  const mode = dateTimeMode(props);
   const value = asText(props.value);
-  const showClear = props.clearable && value !== "";
   const check = useChecks(props.checks, props.value);
+  const [parts, setParts] = useState(() => splitDateTime(value));
+  // The last value this control wrote. A different value comes from the
+  // data model (the agent, a binding) and replaces the parts; the control's
+  // own write keeps a half-filled date and time as they are.
+  const written = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (value === written.current) return;
+    written.current = undefined;
+    setParts(splitDateTime(value));
+  }, [value]);
+  const write = (next: DateTimeParts) => {
+    setParts(next);
+    const nextValue = joinDateTime(next, mode);
+    if (nextValue !== value) {
+      written.current = nextValue;
+      props.setValue(nextValue);
+    }
+  };
+
+  const min = splitDateTime(asText(props.min));
+  const max = splitDateTime(asText(props.max));
+  // A bound on the time applies on its own day only, when there is a date.
+  const timeMin =
+    mode === "time" || (min.time && parts.date === min.date)
+      ? min.time || undefined
+      : undefined;
+  const timeMax =
+    mode === "time" || (max.time && parts.date === max.date)
+      ? max.time || undefined
+      : undefined;
+
+  const summary = describeDateTime(parts, mode);
+  const isSplit = mode === "datetime";
+  const showClear = props.clearable && (parts.date !== "" || parts.time !== "");
+  const style = controlStyle({ ...props, pill: false }, "xl");
+  const common = {
+    "data-a2ui-input": "",
+    disabled: props.disabled,
+    required: props.required,
+    "aria-invalid": check.invalid || undefined,
+    "aria-describedby": summary ? summaryId : undefined,
+  };
+  // One field names itself after the label; two fields are named "Date"
+  // and "Time" inside a group the label names.
+  const singleAria = isSplit ? {} : controlAria(aria);
+  const singleLabel = isSplit
+    ? undefined
+    : (singleAria["aria-label"] ??
+      (props.label ? undefined : props.placeholder));
+  const single = isSplit
+    ? {}
+    : { id, "aria-description": singleAria["aria-description"] };
+
+  const dateField = (
+    <input
+      {...common}
+      {...single}
+      type="date"
+      aria-label={isSplit ? "Date" : singleLabel}
+      min={min.date || undefined}
+      max={max.date || undefined}
+      placeholder={props.placeholder}
+      value={parts.date}
+      onChange={(event) => write({ ...parts, date: event.target.value })}
+      style={{ ...style, flex: "1 1 10em", width: "auto" }}
+    />
+  );
+  const timeField =
+    props.timeStep !== undefined ? (
+      <select
+        {...common}
+        {...single}
+        aria-label={isSplit ? "Time" : singleLabel}
+        value={parts.time.slice(0, 5)}
+        onChange={(event) => write({ ...parts, time: event.target.value })}
+        style={{ ...style, flex: "1 1 8em", width: "auto" }}
+      >
+        <option value="">{props.placeholder ?? "Time"}</option>
+        {timeSlots(props.timeStep, timeMin, timeMax, parts.time).map(
+          (slot) => (
+            <option key={slot} value={slot}>
+              {describeDateTime({ date: "", time: slot }, "time") ?? slot}
+            </option>
+          ),
+        )}
+      </select>
+    ) : (
+      <input
+        {...common}
+        {...single}
+        type="time"
+        aria-label={isSplit ? "Time" : singleLabel}
+        min={timeMin}
+        max={timeMax}
+        placeholder={props.placeholder}
+        value={parts.time}
+        onChange={(event) => write({ ...parts, time: event.target.value })}
+        style={{ ...style, flex: "1 1 8em", width: "auto" }}
+      />
+    );
+
   return (
     <Field
       label={props.label}
-      htmlFor={id}
+      htmlFor={isSplit ? undefined : id}
+      labelId={isSplit ? labelId : undefined}
       weight={props.weight}
       error={check.error}
       onBlur={check.onBlur}
     >
       <div
+        role={isSplit ? "group" : undefined}
+        aria-labelledby={isSplit && props.label ? labelId : undefined}
+        {...(isSplit ? controlAria(aria) : {})}
         style={{
           display: props.block ? "flex" : "inline-flex",
+          flexWrap: "wrap",
           width: props.block ? "100%" : undefined,
+          maxWidth: "100%",
           gap: spacing(2),
           alignItems: "center",
         }}
       >
-        <input
-          id={id}
-          type={dateTimeInputType(props)}
-          data-a2ui-input=""
-          min={props.min}
-          max={props.max}
-          placeholder={props.placeholder}
-          aria-label={props.label ? undefined : props.placeholder}
-          disabled={props.disabled}
-          required={props.required}
-          aria-invalid={check.invalid || undefined}
-          value={value}
-          onChange={(event) => props.setValue(event.target.value)}
-          style={controlStyle(props, "xl")}
-          {...controlAria(aria)}
-        />
+        {mode !== "time" ? dateField : null}
+        {mode !== "date" ? timeField : null}
         {showClear ? (
           <button
             type="button"
             data-a2ui-input=""
             aria-label="Clear"
-            onClick={() => props.setValue("")}
+            onClick={() => write({ date: "", time: "" })}
             style={{
               minWidth: 24,
               minHeight: 24,
@@ -925,6 +1120,15 @@ function DateTimeInput(props: DateTimeInputProps) {
           </button>
         ) : null}
       </div>
+      {summary ? (
+        <span
+          id={summaryId}
+          data-a2ui-datetime-summary=""
+          style={{ ...textFont("sm"), color: textColor("secondary") }}
+        >
+          {summary}
+        </span>
+      ) : null}
     </Field>
   );
 }
@@ -1707,7 +1911,7 @@ export const inputComponents = {
   DateTimeInput: {
     component: DateTimeInput,
     description:
-      'A date picker, or a time picker with enableTime, or both. The value is ISO 8601. Bind value with { "@path": "/x" } to read it. Give it a label.',
+      'A date picker, or a time picker with enableTime, or both. Set timeStep (minutes) to offer fixed times, e.g. 30 for a booking. The value is ISO 8601. Bind value with { "@path": "/x" } to read it. Give it a label.',
     props: dateTimeInputSchema,
     writable: VALUE_WRITABLE,
   },
