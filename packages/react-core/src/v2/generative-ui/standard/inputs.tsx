@@ -1058,10 +1058,10 @@ function DateTimeInput(props: DateTimeInputProps) {
   const write = (next: DateTimeParts) => {
     setParts(next);
     const nextValue = joinDateTime(next, mode);
-    if (nextValue !== value) {
-      written.current = nextValue;
-      props.setValue(nextValue);
-    }
+    written.current = nextValue;
+    // Written even when unchanged: the write makes the value the user's, so
+    // a later agent write does not replace a half-filled date and time.
+    props.setValue(nextValue);
   };
 
   const min = splitDateTime(asText(props.min));

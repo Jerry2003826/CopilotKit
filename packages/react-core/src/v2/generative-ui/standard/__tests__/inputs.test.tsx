@@ -820,6 +820,27 @@ describe("standard inputs: DateTimeInput", () => {
     expect(form.checkValidity()).toBe(true);
   });
 
+  it("keeps a half-filled date and time when the agent writes the value afterwards", async () => {
+    const view = renderInputs(
+      [
+        {
+          id: "root",
+          component: "DateTimeInput",
+          label: "Pickup",
+          enableDate: true,
+          enableTime: true,
+          value: { "@path": "/when" },
+        },
+      ],
+      { when: "" },
+    );
+    const date = (await view.findByLabelText("Date")) as HTMLInputElement;
+    fireEvent.change(date, { target: { value: "2026-10-23" } });
+    act(() => view.update(agentWrite("/when", "2026-12-01T08:00")));
+    expect(date.value).toBe("2026-10-23");
+    expect(view.dataAt("/when")).toBe("");
+  });
+
   it("keeps a single time field named by its label", async () => {
     const view = renderInputs(
       [
