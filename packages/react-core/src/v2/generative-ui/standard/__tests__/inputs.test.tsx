@@ -768,6 +768,58 @@ describe("standard inputs: DateTimeInput", () => {
     expect(view.queryByRole("alert")).toBeNull();
   });
 
+  it("steps the slots from the range start, and compares bounds with their seconds", () => {
+    expect(timeSlots(30, "09:15", "10:15")).toEqual([
+      "09:15",
+      "09:45",
+      "10:15",
+    ]);
+    expect(timeSlots(30, "09:15", "09:20")).toEqual(["09:15"]);
+    expect(timeSlots(90, "23:00", "02:00")).toEqual([
+      "23:00",
+      "00:30",
+      "02:00",
+    ]);
+    expect(timeInRange("10:00:30", undefined, "10:00")).toBe(false);
+    expect(timeInRange("10:00", undefined, "10:00:30")).toBe(true);
+  });
+
+  it("gives an impossible date no summary rather than a rolled-over one", () => {
+    expect(
+      describeDateTime({ date: "2026-02-30", time: "" }, "date"),
+    ).toBeUndefined();
+    expect(
+      describeDateTime({ date: "", time: "25:00" }, "time"),
+    ).toBeUndefined();
+  });
+
+  it("does not let a form submit half a date and time, and allows both empty", async () => {
+    const view = renderInputs(
+      [
+        { id: "root", component: "Form", label: "Booking", children: ["when"] },
+        {
+          id: "when",
+          component: "DateTimeInput",
+          label: "Pickup",
+          enableDate: true,
+          enableTime: true,
+          value: { "@path": "/when" },
+        },
+      ],
+      { when: "" },
+    );
+    const form = (await view.findByRole("form")) as HTMLFormElement;
+    expect(form.checkValidity()).toBe(true);
+    const time = view.getByLabelText("Time") as HTMLInputElement;
+    fireEvent.change(view.getByLabelText("Date"), {
+      target: { value: "2026-10-23" },
+    });
+    expect(form.checkValidity()).toBe(false);
+    expect(time.validationMessage).toBe("Pick a time too");
+    fireEvent.change(time, { target: { value: "14:30" } });
+    expect(form.checkValidity()).toBe(true);
+  });
+
   it("keeps a single time field named by its label", async () => {
     const view = renderInputs(
       [

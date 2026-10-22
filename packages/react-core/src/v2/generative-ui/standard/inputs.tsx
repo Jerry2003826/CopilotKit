@@ -942,7 +942,17 @@ export function describeDateTime(
       time ? Number(time[2]) : 0,
     ),
   );
-  if (Number.isNaN(at.getTime())) return;
+  // Date.UTC rolls an impossible value over (February 30 to March 2); such
+  // a value gets no summary rather than a different one.
+  const exact =
+    (!date ||
+      (at.getUTCFullYear() === Number(date[1]) &&
+        at.getUTCMonth() === Number(date[2]) - 1 &&
+        at.getUTCDate() === Number(date[3]))) &&
+    (!time ||
+      (at.getUTCHours() === Number(time[1]) &&
+        at.getUTCMinutes() === Number(time[2])));
+  if (Number.isNaN(at.getTime()) || !exact) return;
   return new Intl.DateTimeFormat(locale, {
     timeZone: "UTC",
     ...(mode === "time"
@@ -958,23 +968,36 @@ function minuteToTime(minute: number) {
   return `${pad(Math.floor(minute / 60))}:${pad(minute % 60)}`;
 }
 
+/** "HH:MM:SS" of a time, seconds "00" when left out, so times compare as text. */
+function fullTime(time: string) {
+  const match = /^(\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(time);
+  if (!match) return time;
+  return `${match[1].padStart(2, "0")}:${match[2]}:${match[3] ?? "00"}`;
+}
+
+/** The minute of the day of a time, rounded up to a whole minute. */
+function timeToMinute(time: string) {
+  const [hours, minutes, seconds] = fullTime(time).split(":").map(Number);
+  return hours * 60 + minutes + (seconds > 0 ? 1 : 0);
+}
+
 /**
- * True when `time` ("HH:MM") lies within `min`..`max`. A `min` after `max`
- * is a range over midnight, such as 22:00 to 02:00.
+ * True when `time` lies within `min`..`max`, seconds included. A `min`
+ * after `max` is a range over midnight, such as 22:00 to 02:00.
  */
 export function timeInRange(time: string, min?: string, max?: string) {
-  const at = time.slice(0, 5);
-  const from = min?.slice(0, 5);
-  const to = max?.slice(0, 5);
+  const at = fullTime(time);
+  const from = min ? fullTime(min) : undefined;
+  const to = max ? fullTime(max) : undefined;
   if (from && to && from > to) return at >= from || at <= to;
   return (!from || at >= from) && (!to || at <= to);
 }
 
 /**
- * The times of a day `step` minutes apart within `min`..`max` ("HH:MM"),
- * from `min` on (a range over midnight continues after 23:59), plus
- * `current` when it is set and not one of them, so the list shows the value
- * it holds even when that value is out of range.
+ * The times `step` minutes apart from `min` (or midnight) up to `max` (or
+ * the end of the day), "HH:MM". A range over midnight continues after
+ * 23:59. `current` is added when it is set and not one of them, so the list
+ * shows the value it holds even when that value is out of range.
  */
 export function timeSlots(
   step: number,
@@ -982,19 +1005,28 @@ export function timeSlots(
   max?: string,
   current?: string,
 ): string[] {
-  const from = min?.slice(0, 5);
-  const wraps = Boolean(from && max && from > max.slice(0, 5));
-  // Order a range over midnight from its start: 22:00, 23:00, 00:00.
-  const order = (time: string) =>
-    wraps && from && time < from ? `1${time}` : `0${time}`;
+  const day = 24 * 60;
+  const start = min ? timeToMinute(min) : 0;
+  let end = max
+    ? timeToMinute(max) - (fullTime(max).endsWith(":00") ? 0 : 1)
+    : day - 1;
+  if (end < start) end += day;
   const slots: string[] = [];
-  for (let minute = 0; minute < 24 * 60; minute += step) {
-    const time = minuteToTime(minute);
-    if (timeInRange(time, min, max)) slots.push(time);
+  for (
+    let minute = start;
+    minute <= end && minute < start + day;
+    minute += step
+  ) {
+    slots.push(minuteToTime(minute % day));
   }
   const shown = current?.slice(0, 5);
-  if (shown && !slots.includes(shown)) slots.push(shown);
-  return slots.sort((a, b) => (order(a) < order(b) ? -1 : 1));
+  if (shown && !slots.includes(shown)) {
+    // In order from the start of the range.
+    const offset = (time: string) => (timeToMinute(time) - start + day) % day;
+    const index = slots.findIndex((slot) => offset(slot) > offset(shown));
+    slots.splice(index === -1 ? slots.length : index, 0, shown);
+  }
+  return slots;
 }
 
 /**
@@ -1064,9 +1096,21 @@ function DateTimeInput(props: DateTimeInputProps) {
         code: "TIME_OUT_OF_RANGE",
       }
     : undefined;
+  // Half a date and time is no value: the empty field is invalid, so a
+  // form does not drop what the user entered. Both empty stays valid.
+  const dateField = useRef<HTMLInputElement>(null);
+  const timeInput = useRef<HTMLInputElement>(null);
+  const halfFilled =
+    mode === "datetime" && (parts.date === "") !== (parts.time === "");
+  const dateMessage = halfFilled && parts.date === "" ? "Pick a date too" : "";
+  const timeMessage =
+    rangeError?.message ??
+    (halfFilled && parts.time === "" ? "Pick a time too" : "");
   useEffect(() => {
-    slotList.current?.setCustomValidity(rangeError?.message ?? "");
-  }, [rangeError?.message]);
+    dateField.current?.setCustomValidity(dateMessage);
+    slotList.current?.setCustomValidity(timeMessage);
+    timeInput.current?.setCustomValidity(timeMessage);
+  }, [dateMessage, timeMessage, props.timeStep]);
 
   const summary = describeDateTime(parts, mode);
   const isSplit = mode === "datetime";
@@ -1090,10 +1134,11 @@ function DateTimeInput(props: DateTimeInputProps) {
     ? {}
     : { id, "aria-description": singleAria["aria-description"] };
 
-  const dateField = (
+  const dateControl = (
     <input
       {...common}
       {...single}
+      ref={dateField}
       type="date"
       aria-label={isSplit ? "Date" : singleLabel}
       min={min.date || undefined}
@@ -1127,6 +1172,7 @@ function DateTimeInput(props: DateTimeInputProps) {
       <input
         {...common}
         {...single}
+        ref={timeInput}
         type="time"
         aria-label={isSplit ? "Time" : singleLabel}
         min={timeMin}
@@ -1160,7 +1206,7 @@ function DateTimeInput(props: DateTimeInputProps) {
           alignItems: "center",
         }}
       >
-        {mode !== "time" ? dateField : null}
+        {mode !== "time" ? dateControl : null}
         {mode !== "date" ? timeField : null}
         {showClear ? (
           <button
